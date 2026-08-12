@@ -55,6 +55,18 @@ WAKE_SETTLE_SECONDS = 5.0
 
 GO2RTC_RTSP_PORT = 18554
 
+# A genuine HA stream_source() request grants one short-lived authorization
+# for web.py to open exactly one upstream SimpliSafe FLV session.
+#
+# The grant debounce prevents the second stream_source() call that HA commonly
+# makes ~5 seconds later for the same viewing session from creating a second
+# authorization.
+STREAM_LEASE_SECONDS = 30.0
+STREAM_LEASE_GRANT_DEBOUNCE_SECONDS = 10.0
+
+# Passive diagnostic snapshots of the HA-managed go2rtc stream.
+GO2RTC_DIAGNOSTIC_DELAYS = (1.0, 3.0, 8.0)
+
 _StreamResponseT = TypeVar("_StreamResponseT")
 
 
@@ -238,6 +250,21 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
         # authenticated FLV proxy.
         self._proxy_token = secrets.token_urlsafe(24)
 
+        # Register the named go2rtc stream only once per Home Assistant
+        # runtime. Re-registering the same stream while it is actively being
+        # consumed can tear down/reinitialize downstream producers such as the
+        # go2rtc AAC->Opus transcoder.
+        self._go2rtc_registered = False
+
+        # One-shot upstream-start authorization consumed by web.py.
+        # Startup registration intentionally does NOT grant a lease.
+        self._stream_lease_expires_monotonic = 0.0
+        self._last_stream_lease_grant_monotonic = 0.0
+
+        # Incremented for each genuine lease grant so delayed diagnostic
+        # snapshots from an older request can quietly become stale.
+        self._go2rtc_diagnostic_generation = 0
+
     @property
     def proxy_token(self) -> str:
         """Return the secret guarding this camera's FLV proxy URL."""
@@ -252,6 +279,66 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
         """Return the SimpliSafe FLV media URL."""
         return self._device.video_url(width=width)
 
+    def _grant_stream_start_lease(self) -> bool:
+        """Grant one short-lived authorization for one upstream FLV start.
+
+        Home Assistant commonly calls stream_source() more than once during a
+        single viewing session. Calls inside the debounce window therefore
+        refresh nothing and do not create additional start authorizations.
+        """
+        now = time.monotonic()
+
+        if (
+            now - self._last_stream_lease_grant_monotonic
+            < STREAM_LEASE_GRANT_DEBOUNCE_SECONDS
+        ):
+            _LOGGER.debug(
+                "SIMPLIRTC stream lease NOT re-granted for %s; "
+                "within %.0fs debounce window",
+                self.entity_id,
+                STREAM_LEASE_GRANT_DEBOUNCE_SECONDS,
+            )
+            return False
+
+        self._last_stream_lease_grant_monotonic = now
+        self._stream_lease_expires_monotonic = now + STREAM_LEASE_SECONDS
+
+        _LOGGER.debug(
+            "SIMPLIRTC Granted one-shot stream lease for %s "
+            "(expires in %.0fs)",
+            self.entity_id,
+            STREAM_LEASE_SECONDS,
+        )
+
+        self._go2rtc_diagnostic_generation += 1
+        generation = self._go2rtc_diagnostic_generation
+        self.hass.async_create_task(
+            self._async_log_go2rtc_diagnostics(generation),
+            f"simplirtc-go2rtc-diagnostics-{self.entity_id}",
+        )
+
+        return True
+
+    def consume_stream_start_lease(self) -> bool:
+        """Consume one valid upstream-start authorization.
+
+        This method intentionally contains no await points, so check-and-clear
+        is atomic on Home Assistant's event loop.
+        """
+        now = time.monotonic()
+
+        if now >= self._stream_lease_expires_monotonic:
+            self._stream_lease_expires_monotonic = 0.0
+            return False
+
+        self._stream_lease_expires_monotonic = 0.0
+
+        _LOGGER.debug(
+            "SIMPLIRTC Consumed one-shot stream lease for %s",
+            self.entity_id,
+        )
+        return True
+
     @override
     async def stream_source(self) -> str | None:
         """Return the go2rtc RTSP URL for this camera."""
@@ -262,6 +349,16 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
                 self.entity_id,
             )
             return None
+
+        # The first stream_source() call at HA startup is used to register the
+        # named go2rtc stream and must remain passive. Once registration already
+        # exists, a fresh HA stream_source() request is treated as viewer intent
+        # and grants exactly one short-lived upstream-start authorization.
+        #
+        # Grant BEFORE the settle sleep because go2rtc may request the already
+        # registered HTTP source while this method is sleeping.
+        if self._go2rtc_registered:
+            self._grant_stream_start_lease()
 
         # Preserve the original PR's 5-second pre-stream settle period, but
         # do not call the unsupported camera-wakeup endpoint. Rapid repeated
@@ -288,69 +385,101 @@ class SimpliSafeGo2rtcCamera(SimpliSafeCamera):
         go2rtc_source = proxy_url
 
         _LOGGER.debug(
-            "SimpliRTC go2rtc source for %s: %s",
+            "SIMPLIRTC go2rtc source for %s: %s",
             self.entity_id,
             go2rtc_source,
         )
 
-        return await self._async_ensure_go2rtc_rtsp(go2rtc_source)
+        return await self._async_ensure_go2rtc_rtsp(root_source=go2rtc_source)
+
+    async def _async_log_go2rtc_diagnostics(
+        self,
+        generation: int,
+    ) -> None:
+        """SIMPLIRTC topology experiment needs no extra diagnostic probes."""
+        return
 
     async def _async_ensure_go2rtc_rtsp(
         self,
-        source: str,
-    ) -> str | None:
-        """Publish the FLV source through go2rtc and return its RTSP URL."""
+        root_source: str,
+        *,
+        grant_lease: bool = False,
+    ) -> str:
+        """Ensure the single PR-style SIMPLIRTC go2rtc stream exists."""
+        if grant_lease:
+            self.grant_stream_start_lease()
+
+        stream_name = f"simplirtc_{self._device.serial}"
+
+        go2rtc_source = (
+            f"ffmpeg:{root_source}#video=copy#audio=opus"
+        )
+
+        rtsp_url = (
+            f"rtsp://127.0.0.1:{GO2RTC_RTSP_PORT}/{stream_name}"
+        )
+
+        _LOGGER.debug(
+            "SIMPLIRTC PR-style go2rtc source for %s: %s",
+            self.entity_id,
+            go2rtc_source,
+        )
+
         try:
             from homeassistant.components.go2rtc.const import (
                 DOMAIN as GO2RTC_DOMAIN,
             )
 
-            entries = self.hass.config_entries.async_entries(
-                GO2RTC_DOMAIN
-            )
-
+            entries = self.hass.config_entries.async_entries(GO2RTC_DOMAIN)
             if not entries:
-                _LOGGER.error(
-                    "SimpliRTC go2rtc RTSP: "
-                    "no go2rtc config entry found"
-                )
-                return None
+                raise RuntimeError("No go2rtc config entry available")
 
             client = entries[0].runtime_data._rest_client
 
-            name = f"simplirtc_{self._device.serial}"
+            if not self._go2rtc_registered:
+                _LOGGER.debug(
+                    "SIMPLIRTC Registering PR-style go2rtc stream %s "
+                    "ONCE for %s",
+                    stream_name,
+                    self.entity_id,
+                )
 
-            _LOGGER.debug(
-                "Registering go2rtc stream %s for %s",
-                name,
-                self.entity_id,
-            )
+                await client.streams.add(
+                    stream_name,
+                    [go2rtc_source],
+                )
 
-            await client.streams.add(name, [source])
+                self._go2rtc_registered = True
 
-            rtsp_url = (
-                f"rtsp://127.0.0.1:{GO2RTC_RTSP_PORT}/{name}"
-            )
-
-            _LOGGER.debug(
-                "SimpliRTC go2rtc RTSP URL for %s: %s",
-                self.entity_id,
-                rtsp_url,
-            )
-
-            return rtsp_url
+                _LOGGER.debug(
+                    "SIMPLIRTC PR-style go2rtc stream registration "
+                    "complete for %s",
+                    self.entity_id,
+                )
+            else:
+                _LOGGER.debug(
+                    "SIMPLIRTC Reusing existing PR-style go2rtc stream %s "
+                    "for %s (no re-registration)",
+                    stream_name,
+                    self.entity_id,
+                )
 
         except Exception as err:
-            _LOGGER.error(
-                "SimpliRTC go2rtc RTSP publish failed for %s: %r "
-                "(source=%s)",
+            _LOGGER.warning(
+                "SIMPLIRTC go2rtc registration failed for %s: %r",
                 self.entity_id,
                 err,
-                source,
             )
-            return None
+            raise
 
-    @override
+        _LOGGER.debug(
+            "SIMPLIRTC go2rtc RTSP URL for %s: %s",
+            self.entity_id,
+            rtsp_url,
+        )
+
+        return rtsp_url
+
     async def async_camera_image(
         self,
         width: int | None = None,
